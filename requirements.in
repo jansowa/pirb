@@ -1,7 +1,7 @@
 numpy==1.26.4
 transformers
 accelerate
-datasets
+datasets<4.0.0
 evaluate
 optimum
 peft

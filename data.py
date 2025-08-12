@@ -345,7 +345,7 @@ class MAUPQATask(RetrievalTask):
         queries = {}
         passages = {}
         pid = 0
-        rows = load_dataset("ipipan/maupqa", name=self.subset, split="train")
+        rows = load_dataset("ipipan/maupqa", name=self.subset, split="train", trust_remote_code=True)
         for row in rows:
             query_id = str(row["question_id"])
             query_text = row["question"]

@@ -50,7 +50,7 @@ cymem==2.0.11
     #   thinc
 cython==3.1.2
     # via pyserini
-datasets==4.0.0
+datasets==3.6.0
     # via
     #   -r requirements.in
     #   evaluate
@@ -348,7 +348,6 @@ setuptools==80.9.0
     #   marisa-trie
     #   spacy
     #   thinc
-    #   torch
     #   triton
 shellingham==1.5.4
     # via typer

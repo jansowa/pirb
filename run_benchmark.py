@@ -76,6 +76,10 @@ class BenchmarkArgs:
         default=False,
         metadata={"help": "Remove cached indexes after evaluation"}
     )
+    results_json: str = field(
+        default=None,
+        metadata={"help": "If set, dump summary metrics (incl. ndcg_tasks) to this JSON file"}
+    )
 
 
 class RetrievalEvaluator:
@@ -224,6 +228,7 @@ if __name__ == '__main__':
     logging.info("Running evaluation on %d datasets", len(benchmark))
     evaluator = RetrievalEvaluator(args)
     index_paths = []
+    results_to_dump = []
     for encoder in encoders:
         ndcg_tasks = 0.0
         for task in benchmark.tasks:
@@ -235,7 +240,22 @@ if __name__ == '__main__':
             torch.cuda.empty_cache()
         print(evaluator.stats)
         evaluator.stats = {}
-        print(f"Average NDCG@{args.ndcg_k} for {len(benchmark)} tasks: {ndcg_tasks / len(benchmark):.2f}")
+        avg_ndcg = ndcg_tasks / len(benchmark) if len(benchmark) > 0 else 0.0
+        print(f"Average NDCG@{args.ndcg_k} for {len(benchmark)} tasks: {avg_ndcg:.2f}")
+        results_to_dump.append({
+            "model": encoder.get("name", "unknown"),
+            "ndcg_tasks": ndcg_tasks,
+            f"average_ndcg@{args.ndcg_k}": avg_ndcg,
+            "datasets": len(benchmark),
+        })
+
+    if args.results_json:
+        out_dir = os.path.dirname(args.results_json)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(args.results_json, "w", encoding="utf-8") as f:
+            json.dump({"results": results_to_dump}, f, ensure_ascii=False, indent=2)
+
     if args.rm:
         logging.info("Removing cached indexes")
         for index_path in index_paths:
