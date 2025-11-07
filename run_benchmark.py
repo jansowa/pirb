@@ -230,24 +230,28 @@ if __name__ == '__main__':
     index_paths = []
     results_to_dump = []
     for encoder in encoders:
+        model_results = dict()
         ndcg_tasks = 0.0
         for task in benchmark.tasks:
             print(f"Results for task: {task.task_id.upper()}")
             model = AutoIndex.from_config(encoder, task, args)
             _add_index_path(index_paths, model)
-            ndcg_tasks += evaluator.eval_task(task, model, metadata=encoder)
+            single_task_result = evaluator.eval_task(task, model, metadata=encoder)
+            model_results[task.task_id] = single_task_result
+            ndcg_tasks += single_task_result
             del model
             torch.cuda.empty_cache()
         print(evaluator.stats)
         evaluator.stats = {}
         avg_ndcg = ndcg_tasks / len(benchmark) if len(benchmark) > 0 else 0.0
         print(f"Average NDCG@{args.ndcg_k} for {len(benchmark)} tasks: {avg_ndcg:.2f}")
-        results_to_dump.append({
+        model_results.update({
             "model": encoder.get("name", "unknown"),
             "ndcg_tasks": ndcg_tasks,
             f"average_ndcg@{args.ndcg_k}": avg_ndcg,
             "datasets": len(benchmark),
         })
+        results_to_dump.append(model_results)
 
     if args.results_json:
         out_dir = os.path.dirname(args.results_json)
