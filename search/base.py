@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import itertools
 import json
 import os.path
@@ -9,6 +10,8 @@ from sentence_transformers import SentenceTransformer
 from transformers import PreTrainedTokenizer
 
 from data import IndexInput, IndexResult
+
+MAX_RESULTS_CACHE_FILENAME_BYTES = 240
 
 
 def patch_sentence_transformer(model: SentenceTransformer):
@@ -43,7 +46,13 @@ class SearchIndex(ABC):
         return getattr(self, "data_dir")
 
     def results_cache(self, k: int, cache_prefix: str):
-        return f"{cache_prefix}_k{k}_{self.name()}.jsonl.gz"
+        filename = f"{cache_prefix}_k{k}_{self.name()}.jsonl.gz"
+        if len(filename.encode("utf-8")) <= MAX_RESULTS_CACHE_FILENAME_BYTES:
+            return filename
+
+        digest = hashlib.sha1(self.name().encode("utf-8")).hexdigest()[:16]
+        readable_name = self.name()[:80].rstrip("._-")
+        return f"{cache_prefix}_k{k}_{readable_name}_{digest}.jsonl.gz"
 
     def results_exist(self, k: int, cache_prefix: str):
         cache_dir = os.path.join(self.basedir(), "results")
