@@ -80,6 +80,10 @@ class BenchmarkArgs:
         default=None,
         metadata={"help": "If set, dump summary metrics (incl. ndcg_tasks) to this JSON file"}
     )
+    benchmark_label: str = field(
+        default=None,
+        metadata={"help": "Optional checkpoint label included in summary log messages"},
+    )
 
 
 class RetrievalEvaluator:
@@ -244,7 +248,8 @@ if __name__ == '__main__':
         print(evaluator.stats)
         evaluator.stats = {}
         avg_ndcg = ndcg_tasks / len(benchmark) if len(benchmark) > 0 else 0.0
-        print(f"Average NDCG@{args.ndcg_k} for {len(benchmark)} tasks: {avg_ndcg:.2f}")
+        label_prefix = f"[checkpoint: {args.benchmark_label}] " if args.benchmark_label else ""
+        print(f"{label_prefix}Average NDCG@{args.ndcg_k} for {len(benchmark)} tasks: {avg_ndcg:.2f}")
         model_results.update({
             "model": encoder.get("name", "unknown"),
             "ndcg_tasks": ndcg_tasks,
