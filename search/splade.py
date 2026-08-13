@@ -100,19 +100,29 @@ class SpladeEncoder(QueryEncoder):
     def encode_document_vectors(self, splade_vectors: torch.Tensor) -> List[Dict[str, int]]:
         """Quantize a batch of splade vectors into token -> weight dictionaries.
 
-        The whole batch is copied off the device once and quantized as a single
-        matrix. The multiplication deliberately stays in the tensor dtype so
-        half-precision vectors round exactly as they did when every document
-        was converted on its own.
+        The whole batch is copied off the device once, and quantization runs on
+        the non-zero entries of the batch in one go - splade vectors are sparse,
+        so quantizing the full vocabulary would cost far more than it saves. The
+        multiplication deliberately stays in the tensor dtype so half-precision
+        vectors round exactly as they did when every document was converted on
+        its own.
         """
         data = splade_vectors.cpu().numpy()
         if data.ndim == 1:
             data = data.reshape(1, -1)
-        quantized = np.rint(data * self.quantization_factor).astype(int)
+        rows, cols = np.nonzero(data)
+        values = np.rint(data[rows, cols] * self.quantization_factor).astype(int)
+        # np.nonzero returns indices in row-major order, so each document is a
+        # contiguous slice.
+        bounds = np.searchsorted(rows, np.arange(data.shape[0] + 1))
         vocab = self.vocab
         return [
-            {vocab[int(token_id)]: int(row[token_id]) for token_id in np.flatnonzero(row > 0)}
-            for row in quantized
+            {
+                vocab[int(token_id)]: int(value)
+                for token_id, value in zip(cols[start:end], values[start:end])
+                if value > 0
+            }
+            for start, end in zip(bounds[:-1], bounds[1:])
         ]
 
     def encode_document_vector(self, splade_vector: torch.Tensor) -> Dict[str, int]:
