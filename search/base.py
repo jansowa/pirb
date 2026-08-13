@@ -35,6 +35,15 @@ class SearchIndex(ABC):
     def build(self, docs: Iterable[IndexInput]):
         raise NotImplementedError()
 
+    def supports_deferred_build(self) -> bool:
+        """Whether build() may return before the index is queryable.
+
+        Indexes that answer True let the caller start the next task while this
+        index finishes in the background; search() must then block until it is
+        ready.
+        """
+        return False
+
     def search(self, queries: List[IndexInput], k: int, batch_size=1024, verbose=True, cache_prefix=None,
                overwrite=False) -> Dict[str, List[IndexResult]]:
         raise NotImplementedError()

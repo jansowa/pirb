@@ -92,11 +92,30 @@ class RetrievalEvaluator:
         self.args: BenchmarkArgs = args
         self.stats = {}
 
-    def eval_task(self, task: RetrievalTask, index: SearchIndex, metadata=None):
-        cache_prefix = task.task_id
-        needs_rebuild = not index.exists() and not index.results_exist(self.args.recall_k, cache_prefix)
+    def prebuild_index(self, task: RetrievalTask, index: SearchIndex) -> bool:
+        """Build the index of an upcoming task ahead of its evaluation.
+
+        Only useful for indexes whose build() defers CPU-only work to the
+        background: the deferred part then overlaps the encoding of the next
+        task instead of leaving the GPU idle.
+        """
+        if not self._needs_build(task, index):
+            return False
         task.set_limit_queries(self.args.query_limit)
-        if self.args.overwrite or needs_rebuild:
+        index.build(task.passages(self.args.data_dir))
+        return True
+
+    def _needs_build(self, task: RetrievalTask, index: SearchIndex) -> bool:
+        if self.args.overwrite:
+            return True
+        cache_prefix = task.task_id
+        return not index.exists() and not index.results_exist(self.args.recall_k, cache_prefix)
+
+    def eval_task(self, task: RetrievalTask, index: SearchIndex, metadata=None, prebuilt: bool = False):
+        cache_prefix = task.task_id
+        needs_build = not prebuilt and self._needs_build(task, index)
+        task.set_limit_queries(self.args.query_limit)
+        if needs_build:
             index.build(task.passages(self.args.data_dir))
         chunk_doc_mapping = task.get_chunk_document_mapping(self.args.data_dir)
         queries = list(task.queries(self.args.data_dir))
@@ -215,6 +234,41 @@ def _add_index_path(paths: List, index):
         paths.append(index.index_path())
 
 
+def evaluate_encoder(encoder: Dict, tasks: List[RetrievalTask], evaluator: RetrievalEvaluator, args, index_paths: List):
+    """Evaluate one encoder over all tasks, overlapping index builds when possible.
+
+    An index whose build defers CPU-only work to the background is created and
+    built one task ahead, so that work overlaps the encoding of the next task
+    instead of leaving the GPU idle. Indexes without that capability keep the
+    previous strictly sequential behavior.
+    """
+    model_results = dict()
+    ndcg_tasks = 0.0
+    pending = []
+
+    def evaluate_pending():
+        task, model, prebuilt = pending.pop(0)
+        print(f"Results for task: {task.task_id.upper()}")
+        result = evaluator.eval_task(task, model, metadata=encoder, prebuilt=prebuilt)
+        model_results[task.task_id] = result
+        del model
+        torch.cuda.empty_cache()
+        return result
+
+    for task in tasks:
+        model = AutoIndex.from_config(encoder, task, args)
+        _add_index_path(index_paths, model)
+        lookahead = 1 if model.supports_deferred_build() else 0
+        prebuilt = evaluator.prebuild_index(task, model) if lookahead else False
+        pending.append((task, model, prebuilt))
+        del model
+        while len(pending) > lookahead:
+            ndcg_tasks += evaluate_pending()
+    while pending:
+        ndcg_tasks += evaluate_pending()
+    return model_results, ndcg_tasks
+
+
 if __name__ == '__main__':
     logging.basicConfig(format='%(asctime)s : %(message)s', level=logging.INFO)
     logging.root.setLevel(logging.INFO)
@@ -234,17 +288,7 @@ if __name__ == '__main__':
     index_paths = []
     results_to_dump = []
     for encoder in encoders:
-        model_results = dict()
-        ndcg_tasks = 0.0
-        for task in benchmark.tasks:
-            print(f"Results for task: {task.task_id.upper()}")
-            model = AutoIndex.from_config(encoder, task, args)
-            _add_index_path(index_paths, model)
-            single_task_result = evaluator.eval_task(task, model, metadata=encoder)
-            model_results[task.task_id] = single_task_result
-            ndcg_tasks += single_task_result
-            del model
-            torch.cuda.empty_cache()
+        model_results, ndcg_tasks = evaluate_encoder(encoder, benchmark.tasks, evaluator, args, index_paths)
         print(evaluator.stats)
         evaluator.stats = {}
         avg_ndcg = ndcg_tasks / len(benchmark) if len(benchmark) > 0 else 0.0

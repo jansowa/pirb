@@ -1,7 +1,10 @@
+import atexit
 import json
 import logging
 import os.path
 import shutil
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import List, Iterable, Dict, Optional, TextIO
 import numpy as np
 import torch
@@ -15,6 +18,34 @@ from search.base import SearchIndex
 # Temporary A/B switch used by the perf harness in perf_scratch/. Read in this
 # single place so it can be deleted together with the harness.
 LEGACY_WRITE_BATCH = os.environ.get("PIRB_LEGACY_WRITE_BATCH", "0") == "1"
+
+# Encoding a corpus needs the GPU and building a Lucene index needs the CPU, so
+# the two phases of different tasks can run at the same time. The pool is shared
+# by every index in the process: it caps how many Lucene indexes are built
+# simultaneously, no matter how many indexes are in flight.
+_BUILD_LOCK = threading.Lock()
+_BUILD_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_ACTIVE_BUILDS: Dict[str, Future] = {}
+
+
+def _get_build_executor(max_workers: int) -> ThreadPoolExecutor:
+    global _BUILD_EXECUTOR
+    with _BUILD_LOCK:
+        if _BUILD_EXECUTOR is None:
+            _BUILD_EXECUTOR = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="lucene-build")
+            # A shared pool cannot be closed by whichever index happens to be
+            # collected first, so it is drained once at interpreter shutdown.
+            atexit.register(shutdown_build_executor)
+        return _BUILD_EXECUTOR
+
+
+def shutdown_build_executor() -> None:
+    """Wait for pending index builds and drop the shared pool."""
+    global _BUILD_EXECUTOR
+    with _BUILD_LOCK:
+        executor, _BUILD_EXECUTOR = _BUILD_EXECUTOR, None
+    if executor is not None:
+        executor.shutdown(wait=True)
 
 
 class SpladeEncoder(QueryEncoder):
@@ -150,9 +181,13 @@ class SpladeIndex(SearchIndex):
         self.use_bettertransformer = use_bettertransformer
         self.quantization_factor = config.get("quantization_factor", 100)
         self.threads = config.get("threads", 8)
+        # Number of Lucene indexes that may be built in the background at once.
+        # 0 keeps the index build inline, exactly as before.
+        self.index_build_workers = max(0, int(config.get("index_build_workers", 1)))
         self.backend = self._create_backend(config)
         self.encoder: Optional[SpladeEncoder] = None
         self.searcher = None
+        self._pending_build: Optional[Future] = None
 
     def _get_backend_name(self, config: Dict):
         backend = config.get("backend", "lucene")
@@ -180,10 +215,28 @@ class SpladeIndex(SearchIndex):
             self.encoder = SpladeEncoder(self.config, self.use_bettertransformer, self.quantization_factor)
         return self.encoder
 
+    def supports_deferred_build(self) -> bool:
+        """Whether build() returns before the index is queryable."""
+        return self.index_build_workers > 0
+
+    def wait_for_build(self):
+        """Block until a backgrounded index build finishes, re-raising its error."""
+        pending, self._pending_build = self._pending_build, None
+        if pending is not None:
+            pending.result()
+
     def exists(self) -> bool:
+        # An index that is still being written is not usable yet.
+        self.wait_for_build()
         return self.backend.exists()
 
     def build(self, docs: Iterable[IndexInput]):
+        # Another index object may be writing into the same directory when
+        # several tasks share an index cache; never remove it underneath them.
+        with _BUILD_LOCK:
+            concurrent_build = _ACTIVE_BUILDS.get(self.index_dir)
+        if concurrent_build is not None:
+            concurrent_build.result()
         if self.exists(): shutil.rmtree(self.index_dir)
         if self.encoder is None: self._get_encoder()
         docs_dir = os.path.join(self.base_dir, "docs")
@@ -201,7 +254,25 @@ class SpladeIndex(SearchIndex):
                 if len(batch) > 0:
                     self._write_batch(batch, docs_file)
         os.makedirs(self.index_dir, exist_ok=True)
-        self.backend.build(docs_path)
+        if self.index_build_workers <= 0:
+            self.backend.build(docs_path)
+            return
+        self._pending_build = self._submit_build(docs_path)
+
+    def _submit_build(self, docs_path: str) -> Future:
+        index_dir = self.index_dir
+        executor = _get_build_executor(self.index_build_workers)
+        future = executor.submit(self.backend.build, docs_path)
+        with _BUILD_LOCK:
+            _ACTIVE_BUILDS[index_dir] = future
+
+        def release(_future: Future):
+            with _BUILD_LOCK:
+                if _ACTIVE_BUILDS.get(index_dir) is _future:
+                    del _ACTIVE_BUILDS[index_dir]
+
+        future.add_done_callback(release)
+        return future
 
     def _write_batch(self, batch: List[IndexInput], output: TextIO):
         texts = [val.text for val in batch]
@@ -220,6 +291,8 @@ class SpladeIndex(SearchIndex):
     def search(self, queries: List[IndexInput], k: int, batch_size=1024, verbose=True, cache_prefix=None, overwrite=False) -> Dict:
         results = self.load_results_from_cache(k, cache_prefix) if not overwrite else None
         if results is not None: return results
+        # No query may hit a half-written index.
+        self.wait_for_build()
         if self.encoder is None: self._get_encoder()
         results = {}
         for i in tqdm(range(0, len(queries), batch_size), desc="Searching in splade index", disable=not verbose):
@@ -245,6 +318,12 @@ class SpladeIndex(SearchIndex):
     def index_path(self) -> str:
         return self.index_dir
 
-    def __del__(self):
-        if hasattr(self, "backend") and self.backend is not None:
+    def close(self):
+        # Never drop the backend while a build thread is still using it.
+        if hasattr(self, "_pending_build"):
+            self.wait_for_build()
+        if getattr(self, "backend", None) is not None:
             self.backend.close()
+
+    def __del__(self):
+        self.close()
