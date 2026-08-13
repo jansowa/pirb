@@ -12,6 +12,10 @@ from backend import IndexBackend, SparseBackend
 from data import IndexInput
 from search.base import SearchIndex
 
+# Temporary A/B switch used by the perf harness in perf_scratch/. Read in this
+# single place so it can be deleted together with the harness.
+LEGACY_WRITE_BATCH = os.environ.get("PIRB_LEGACY_WRITE_BATCH", "0") == "1"
+
 
 class SpladeEncoder(QueryEncoder):
 
@@ -62,7 +66,29 @@ class SpladeEncoder(QueryEncoder):
         del splade_vectors
         return result
 
-    def encode_document_vector(self, splade_vector: torch.Tensor):
+    def encode_document_vectors(self, splade_vectors: torch.Tensor) -> List[Dict[str, int]]:
+        """Quantize a batch of splade vectors into token -> weight dictionaries.
+
+        The whole batch is copied off the device once and quantized as a single
+        matrix. The multiplication deliberately stays in the tensor dtype so
+        half-precision vectors round exactly as they did when every document
+        was converted on its own.
+        """
+        data = splade_vectors.cpu().numpy()
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+        quantized = np.rint(data * self.quantization_factor).astype(int)
+        vocab = self.vocab
+        return [
+            {vocab[int(token_id)]: int(row[token_id]) for token_id in np.flatnonzero(row > 0)}
+            for row in quantized
+        ]
+
+    def encode_document_vector(self, splade_vector: torch.Tensor) -> Dict[str, int]:
+        return self.encode_document_vectors(splade_vector)[0]
+
+    def encode_document_vector_legacy(self, splade_vector: torch.Tensor):
+        """Pre-vectorization implementation, kept for the perf harness only."""
         data = splade_vector.cpu().numpy()
         idx = np.nonzero(data)
         data = data[idx]
@@ -176,8 +202,11 @@ class SpladeIndex(SearchIndex):
         splade_batch = self.encoder.encode_batch(texts)
         if len(texts) == 1:
             splade_batch = splade_batch.unsqueeze(0)
-        for doc, splade_vector in zip(batch, splade_batch):
-            splade_dict = self.encoder.encode_document_vector(splade_vector)
+        if LEGACY_WRITE_BATCH:
+            splade_dicts = [self.encoder.encode_document_vector_legacy(vector) for vector in splade_batch]
+        else:
+            splade_dicts = self.encoder.encode_document_vectors(splade_batch)
+        for doc, splade_dict in zip(batch, splade_dicts):
             dict_ = dict(id=doc.id, content="", vector=splade_dict)
             json_dict = json.dumps(dict_, ensure_ascii=False)
             output.write(json_dict + "\n")
