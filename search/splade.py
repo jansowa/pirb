@@ -136,7 +136,10 @@ class SpladeEncoder(QueryEncoder):
 class SpladeIndex(SearchIndex):
 
     def __init__(self, config: Dict, data_dir: str, use_bettertransformer: bool = False):
-        self.batch_size = 32
+        # Queries are a handful of tokens while passages are encoded at
+        # max_seq_length, so the corpus batch size can be tuned separately.
+        self.batch_size = int(config.get("batch_size", 32))
+        self.index_batch_size = int(config.get("index_batch_size", self.batch_size))
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.config = config
         self.data_dir = data_dir
@@ -164,6 +167,9 @@ class SpladeIndex(SearchIndex):
             backend["index_dir"] = self.index_dir
         else:
             raise AssertionError("'backend' arg accepts backend name or backend config as dict")
+        # Without this the thread count from the model config never reached the
+        # backend, which silently kept its own default.
+        backend.setdefault("threads", self.threads)
         if backend["backend_type"] == "lucene":
             # noinspection PyTypeChecker
             backend["encoder_provider"] = self._get_encoder
@@ -189,7 +195,7 @@ class SpladeIndex(SearchIndex):
                 batch = []
                 for doc in docs:
                     batch.append(doc)
-                    if len(batch) >= self.batch_size:
+                    if len(batch) >= self.index_batch_size:
                         self._write_batch(batch, docs_file)
                         batch = []
                 if len(batch) > 0:
