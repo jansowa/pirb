@@ -15,10 +15,6 @@ from backend import IndexBackend, SparseBackend
 from data import IndexInput
 from search.base import SearchIndex
 
-# Temporary A/B switch used by the perf harness in perf_scratch/. Read in this
-# single place so it can be deleted together with the harness.
-LEGACY_WRITE_BATCH = os.environ.get("PIRB_LEGACY_WRITE_BATCH", "0") == "1"
-
 # Encoding a corpus needs the GPU and building a Lucene index needs the CPU, so
 # the two phases of different tasks can run at the same time. The pool is shared
 # by every index in the process: it caps how many Lucene indexes are built
@@ -97,39 +93,7 @@ class SpladeEncoder(QueryEncoder):
         del splade_vectors
         return result
 
-    def encode_document_vectors(self, splade_vectors: torch.Tensor) -> List[Dict[str, int]]:
-        """Quantize a batch of splade vectors into token -> weight dictionaries.
-
-        The whole batch is copied off the device once, and quantization runs on
-        the non-zero entries of the batch in one go - splade vectors are sparse,
-        so quantizing the full vocabulary would cost far more than it saves. The
-        multiplication deliberately stays in the tensor dtype so half-precision
-        vectors round exactly as they did when every document was converted on
-        its own.
-        """
-        data = splade_vectors.cpu().numpy()
-        if data.ndim == 1:
-            data = data.reshape(1, -1)
-        rows, cols = np.nonzero(data)
-        values = np.rint(data[rows, cols] * self.quantization_factor).astype(int)
-        # np.nonzero returns indices in row-major order, so each document is a
-        # contiguous slice.
-        bounds = np.searchsorted(rows, np.arange(data.shape[0] + 1))
-        vocab = self.vocab
-        return [
-            {
-                vocab[int(token_id)]: int(value)
-                for token_id, value in zip(cols[start:end], values[start:end])
-                if value > 0
-            }
-            for start, end in zip(bounds[:-1], bounds[1:])
-        ]
-
-    def encode_document_vector(self, splade_vector: torch.Tensor) -> Dict[str, int]:
-        return self.encode_document_vectors(splade_vector)[0]
-
-    def encode_document_vector_legacy(self, splade_vector: torch.Tensor):
-        """Pre-vectorization implementation, kept for the perf harness only."""
+    def encode_document_vector(self, splade_vector: torch.Tensor):
         data = splade_vector.cpu().numpy()
         idx = np.nonzero(data)
         data = data[idx]
@@ -289,11 +253,8 @@ class SpladeIndex(SearchIndex):
         splade_batch = self.encoder.encode_batch(texts)
         if len(texts) == 1:
             splade_batch = splade_batch.unsqueeze(0)
-        if LEGACY_WRITE_BATCH:
-            splade_dicts = [self.encoder.encode_document_vector_legacy(vector) for vector in splade_batch]
-        else:
-            splade_dicts = self.encoder.encode_document_vectors(splade_batch)
-        for doc, splade_dict in zip(batch, splade_dicts):
+        for doc, splade_vector in zip(batch, splade_batch):
+            splade_dict = self.encoder.encode_document_vector(splade_vector)
             dict_ = dict(id=doc.id, content="", vector=splade_dict)
             json_dict = json.dumps(dict_, ensure_ascii=False)
             output.write(json_dict + "\n")
