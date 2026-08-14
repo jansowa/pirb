@@ -1,6 +1,6 @@
 import os
 from collections import defaultdict
-from typing import List, Dict
+from typing import List, Dict, Optional
 import numpy as np
 from seismic import SeismicIndex
 from backend import SparseBackend
@@ -14,13 +14,14 @@ class SeismicBackend(SparseBackend):
         self.index_path = os.path.join(self.index_dir, "cached")
         self._index = None
 
-    def build(self, corpus_path: str):
+    def build(self, corpus_path: str, target_dir: Optional[str] = None):
+        index_path = os.path.join(target_dir, "cached") if target_dir else self.index_path
         self._index = SeismicIndex.build(corpus_path)
         print("Number of documents:", self._index.len)
         print("Avg number of non-zero components:", self._index.nnz / self._index.len)
         print("Dimensionality of the vectors:", self._index.dim)
         self._index.print_space_usage_byte()
-        self._index.save(self.index_path)
+        self._index.save(index_path)
 
     def search(self, q: List[str], eq: Dict, ids: List[str], top_k: int) -> Dict[str, List[IndexResult]]:
         if self._index is None:

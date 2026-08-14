@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict
+from typing import List, Dict, Optional
 from data import IndexResult
 
 
@@ -33,7 +33,8 @@ class SparseBackend(ABC):
         self.index_dir = index_dir
 
     @abstractmethod
-    def build(self, corpus_path: str):
+    def build(self, corpus_path: str, target_dir: Optional[str] = None):
+        """Build the index, into ``target_dir`` when the caller stages it aside."""
         raise NotImplementedError()
 
     @abstractmethod
@@ -44,6 +45,14 @@ class SparseBackend(ABC):
     @abstractmethod
     def exists(self) -> bool:
         raise NotImplementedError()
+
+    def is_complete(self) -> bool:
+        """Whether the index on disk is usable, not merely present.
+
+        Backends that can tell a finished index from one left behind by a killed
+        job override this; the default keeps the historical behaviour.
+        """
+        return self.exists()
 
     def close(self):
         pass

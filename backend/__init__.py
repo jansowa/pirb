@@ -26,7 +26,8 @@ class IndexBackend:
             from backend.sparse import LuceneBackend
             encoder_provider = config.get("encoder_provider")
             threads = config.get("threads", 8)
-            return LuceneBackend(index_dir, encoder_provider, threads)
+            expected_doc_count_provider = config.get("expected_doc_count_provider")
+            return LuceneBackend(index_dir, encoder_provider, threads, expected_doc_count_provider)
         elif backend_type == "seismic":
             from backend.sparse_seismic import SeismicBackend
             return SeismicBackend(index_dir)
