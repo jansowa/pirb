@@ -22,6 +22,7 @@ from search.splade_artifacts import (
     PassagesWriter,
     PhaseADecision,
     ResumeMismatch,
+    SampledDocument,
     decide_phase_a,
     passages_manifest_path,
     read_passages_manifest,
@@ -46,6 +47,19 @@ from utils.artifacts import (
 _BUILD_LOCK = threading.Lock()
 _BUILD_EXECUTOR: Optional[ThreadPoolExecutor] = None
 _ACTIVE_BUILDS: Dict[str, Future] = {}
+
+
+def _top_token_overlap(stored: Dict, fresh: Dict, top_k: int) -> float:
+    """Share of the strongest tokens of two splade vectors that agree."""
+    def strongest(vector: Dict):
+        return {token for token, _weight in sorted(vector.items(), key=lambda item: -item[1])[:top_k]}
+
+    left, right = strongest(stored), strongest(fresh)
+    if not left and not right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
 
 
 def _get_build_executor(max_workers: int) -> ThreadPoolExecutor:
@@ -190,6 +204,9 @@ class SpladeIndex(SearchIndex):
         # How often the encoding manifest is rewritten, in batches. More often
         # means less re-encoding after a kill and more small atomic writes.
         self.manifest_flush_batches = max(1, int(config.get("manifest_flush_batches", 100)))
+        # Documents re-encoded to identify the model behind an encoded corpus that
+        # has no manifest. A few dozen cost seconds and save hours.
+        self.legacy_sample_size = max(2, int(config.get("legacy_sample_size", 64)))
         self.threads = config.get("threads", 8)
         # Number of Lucene indexes that may be built in the background at once.
         # 0 keeps the index build inline, exactly as before.
@@ -291,7 +308,46 @@ class SpladeIndex(SearchIndex):
         if self.corpus_path is None:
             # Without the corpus behind the stream nothing can be verified.
             return PhaseADecision(REBUILD, "the corpus path of this task is unknown", expected)
-        return decide_phase_a(self.manifest_path, self.docs_path, expected, trust_legacy=trust_legacy_artifacts())
+        decision = decide_phase_a(self.manifest_path, self.docs_path, expected,
+                                  trust_legacy=trust_legacy_artifacts(), sample_size=self.legacy_sample_size)
+        if not decision.samples:
+            return decision
+        ok, detail = self._sample_matches_current_model(decision.samples)
+        logging.info("Verified %d sampled document(s) of %s: %s", len(decision.samples), self.docs_path, detail)
+        if ok:
+            return decision
+        return PhaseADecision(REBUILD, f"the encoded corpus was written by another model: {detail}", expected)
+
+    def _sample_matches_current_model(self, samples: List[SampledDocument], top_k: int = 20,
+                                      mean_overlap: float = 0.9, min_overlap: float = 0.6):
+        """Re-encode a few documents and compare them with what is on disk.
+
+        The only thing an encoded corpus without a manifest cannot tell us is
+        which model produced it. Encoding a handful of its documents answers that
+        in seconds, which is what makes an interrupted msmarco-pl run resumable
+        instead of an eight hour re-run.
+
+        Vectors are compared by their strongest tokens rather than exactly:
+        batches pad to their longest member, so the same model does not
+        necessarily reproduce identical weights document by document.
+        """
+        if self.encoder is None: self._get_encoder()
+        overlaps = []
+        with torch.no_grad():
+            for start in range(0, len(samples), self.index_batch_size):
+                batch = samples[start:start + self.index_batch_size]
+                encoded = self.encoder.encode_batch([sample.text for sample in batch])
+                if len(batch) == 1:
+                    encoded = encoded.unsqueeze(0)
+                for sample, vector in zip(batch, encoded):
+                    fresh = self.encoder.encode_document_vector(vector)
+                    overlaps.append(_top_token_overlap(sample.vector, fresh, top_k))
+        if not overlaps:
+            return False, "nothing could be re-encoded"
+        mean = sum(overlaps) / len(overlaps)
+        worst = min(overlaps)
+        detail = f"mean top-{top_k} overlap {mean:.2f}, worst {worst:.2f}"
+        return mean >= mean_overlap and worst >= min_overlap, detail
 
     def _expected_doc_count(self) -> Optional[int]:
         """How many documents a complete index of this task should hold.

@@ -21,11 +21,17 @@ class FakeVectors(list):
 
 
 class FakeEncoder:
-    """Counts encoded documents and can kill the process mid-corpus."""
+    """Counts encoded documents and can kill the process mid-corpus.
 
-    def __init__(self, log_path: str, kill_after: Optional[int] = None):
+    ``model_tag`` stands in for the identity of a checkpoint: vectors are keyed by
+    it, so encoding the same text with a different tag produces a disjoint vector,
+    exactly as a different model would.
+    """
+
+    def __init__(self, log_path: str, kill_after: Optional[int] = None, model_tag: str = "m1"):
         self.log_path = log_path
         self.kill_after = kill_after
+        self.model_tag = model_tag
         self.encoded = 0
 
     def encode_batch(self, texts: List[str]) -> FakeVectors:
@@ -39,7 +45,9 @@ class FakeEncoder:
         return FakeVectors(f"vector-{text}" for text in texts)
 
     def encode_document_vector(self, vector) -> dict:
-        return {"token": 1, "source": str(vector)[:16]}
+        text = str(vector).removeprefix("vector-")
+        tokens = {f"{self.model_tag}_{word}": len(word) + 1 for word in text.split()}
+        return tokens or {f"{self.model_tag}_empty": 1}
 
 
 def encoded_documents(log_path: str) -> int:

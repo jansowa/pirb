@@ -150,15 +150,64 @@ def test_legacy_artifacts_are_adopted_instead_of_recomputed(root, monkeypatch):
     assert read_index_manifest(index.index_dir)["doc_count"] == DOCUMENTS
 
 
-def test_legacy_encoded_corpora_are_recomputed_by_default(root):
+SAMPLE_SIZE = 4
+
+
+def _valid_lines(path):
+    """Lines that a reader could trust, independent of the code under test."""
+    count = 0
+    with open(path, "rb") as input_file:
+        for line in input_file:
+            if not line.endswith(b"\n"):
+                break
+            try:
+                json.loads(line)
+            except ValueError:
+                break
+            count += 1
+    return count
+
+
+def test_a_partial_corpus_without_a_manifest_is_still_resumed(root):
+    """The msmarco case: killed mid-encoding before manifests existed."""
+    run_worker(root, "--kill-after-docs", "80", expect_kill=True)
+    index = paths(root)
+    os.remove(index.manifest_path)
+    already_encoded = _valid_lines(index.docs_path)
+    assert 0 < already_encoded < DOCUMENTS
+    encoded_before = encoded_documents(str(root / ENCODER_LOG))
+
+    result = run_worker(root)
+
+    assert result["encoded_here"] == DOCUMENTS - already_encoded + SAMPLE_SIZE, \
+        "only the remaining documents plus the verification sample may be encoded"
+    assert encoded_documents(str(root / ENCODER_LOG)) == encoded_before + result["encoded_here"]
+    documents = read_passages(index.docs_path)
+    assert [document["id"] for document in documents] == [f"doc_{i}" for i in range(DOCUMENTS)]
+    assert result["complete"] is True
+
+
+def test_a_complete_corpus_without_a_manifest_is_reused(root):
     run_worker(root)
     index = paths(root)
     os.remove(index.manifest_path)
-    os.remove(os.path.join(index.index_dir, ".index_manifest.json"))
     encoded_before = encoded_documents(str(root / ENCODER_LOG))
 
     result = run_worker(root, "--force-build")
 
-    assert result["encoded_here"] == DOCUMENTS
-    assert encoded_documents(str(root / ENCODER_LOG)) == encoded_before + DOCUMENTS
+    assert result["encoded_here"] == SAMPLE_SIZE, "the sample is the only thing worth re-encoding"
+    assert encoded_documents(str(root / ENCODER_LOG)) == encoded_before + SAMPLE_SIZE
     assert os.path.exists(os.path.join(index.base_dir, PASSAGES_MANIFEST_NAME))
+
+
+def test_a_corpus_encoded_by_another_model_is_recomputed(root):
+    run_worker(root)
+    index = paths(root)
+    os.remove(index.manifest_path)
+    encoded_before = encoded_documents(str(root / ENCODER_LOG))
+
+    result = run_worker(root, "--force-build", "--model-tag", "other-checkpoint")
+
+    assert result["encoded_here"] == DOCUMENTS + SAMPLE_SIZE, "a foreign encoding must not be appended to"
+    assert encoded_documents(str(root / ENCODER_LOG)) == encoded_before + DOCUMENTS + SAMPLE_SIZE
+    assert read_passages(index.docs_path)[0]["vector"], "the file was rewritten by the current model"

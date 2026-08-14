@@ -110,18 +110,36 @@ def test_a_changed_corpus_mtime_is_rejected(tmp_path):
     assert "mtime" in decision.reason
 
 
-def test_a_legacy_file_is_rejected_without_the_opt_in(tmp_path):
+def test_a_complete_legacy_file_is_adopted_for_verification(tmp_path):
     corpus = _corpus(tmp_path)
     passages = str(tmp_path / "passages.jsonl")
     _write_passages(passages, 10)
 
     decision = decide_phase_a(str(tmp_path / "missing.json"), passages, _expected(corpus))
 
-    assert decision.action == REBUILD
-    assert "no manifest" in decision.reason
+    assert decision.action == REUSE
+    assert decision.manifest.complete is True
+    assert decision.manifest.written_doc_count == 10
+    assert decision.manifest.last_doc_id == "doc_9"
+    assert decision.samples, "without a manifest the model behind the file has to be checked"
 
 
-def test_a_legacy_file_is_trusted_when_it_is_complete(tmp_path):
+def test_a_partial_legacy_file_is_adopted_and_resumed(tmp_path):
+    """The whole point: an interrupted msmarco run must not encode from zero."""
+    corpus = _corpus(tmp_path)
+    passages = str(tmp_path / "passages.jsonl")
+    _write_passages(passages, 6)
+
+    decision = decide_phase_a(str(tmp_path / "missing.json"), passages, _expected(corpus))
+
+    assert decision.action == RESUME
+    assert decision.skip_docs == 6
+    assert decision.manifest.complete is False
+    assert decision.manifest.last_doc_id == "doc_5"
+    assert decision.manifest.written_bytes == os.path.getsize(passages)
+
+
+def test_the_opt_in_skips_the_sampled_verification(tmp_path):
     corpus = _corpus(tmp_path)
     passages = str(tmp_path / "passages.jsonl")
     _write_passages(passages, 10)
@@ -129,20 +147,60 @@ def test_a_legacy_file_is_trusted_when_it_is_complete(tmp_path):
     decision = decide_phase_a(str(tmp_path / "missing.json"), passages, _expected(corpus), trust_legacy=True)
 
     assert decision.action == REUSE
-    assert decision.manifest.complete is True
-    assert decision.manifest.written_doc_count == 10
-    assert decision.manifest.last_doc_id == "doc_9"
+    assert decision.samples == []
 
 
-def test_a_short_legacy_file_is_still_rejected(tmp_path):
+def test_a_torn_tail_of_a_legacy_file_is_left_out(tmp_path):
     corpus = _corpus(tmp_path)
     passages = str(tmp_path / "passages.jsonl")
     _write_passages(passages, 6)
+    complete_bytes = os.path.getsize(passages)
+    with open(passages, "ab") as passages_file:
+        passages_file.write(b'{"id": "doc_6", "content": "", "vec')
 
-    decision = decide_phase_a(str(tmp_path / "missing.json"), passages, _expected(corpus), trust_legacy=True)
+    decision = decide_phase_a(str(tmp_path / "missing.json"), passages, _expected(corpus))
+
+    assert decision.action == RESUME
+    assert decision.skip_docs == 6
+    assert decision.manifest.written_bytes == complete_bytes
+
+
+def test_a_legacy_file_out_of_step_with_the_corpus_is_rejected(tmp_path):
+    corpus = _corpus(tmp_path)
+    passages = str(tmp_path / "passages.jsonl")
+    with open(passages, "w", encoding="utf-8") as passages_file:
+        for i in (0, 1, 5, 6):
+            passages_file.write(json.dumps({"id": f"doc_{i}", "content": "", "vector": {"a": 1}}) + "\n")
+
+    decision = decide_phase_a(str(tmp_path / "missing.json"), passages, _expected(corpus))
 
     assert decision.action == REBUILD
-    assert "6 of 10" in decision.reason
+    assert "'doc_5'" in decision.reason and "'doc_2'" in decision.reason
+
+
+def test_a_legacy_file_longer_than_the_corpus_is_rejected(tmp_path):
+    corpus = _corpus(tmp_path, documents=4)
+    passages = str(tmp_path / "passages.jsonl")
+    _write_passages(passages, 6)
+
+    decision = decide_phase_a(str(tmp_path / "missing.json"), passages, _expected(corpus))
+
+    assert decision.action == REBUILD
+    assert "more than the 4 documents" in decision.reason
+
+
+def test_adopted_samples_pair_the_corpus_text_with_the_stored_vector(tmp_path):
+    corpus = _corpus(tmp_path)
+    passages = str(tmp_path / "passages.jsonl")
+    _write_passages(passages, 10)
+
+    decision = decide_phase_a(str(tmp_path / "missing.json"), passages, _expected(corpus), sample_size=4)
+
+    assert len(decision.samples) == 4
+    for sample in decision.samples:
+        index = int(sample.doc_id.removeprefix("doc_"))
+        assert sample.text == f"text {index}"
+        assert sample.vector == {"a": 1}
 
 
 def test_a_torn_tail_is_truncated_before_resuming(tmp_path):

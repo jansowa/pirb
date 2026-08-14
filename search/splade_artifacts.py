@@ -12,16 +12,18 @@ neither pyserini nor torch, so it can be tested without a GPU or a JVM.
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+import re
+from collections import deque
+from dataclasses import asdict, dataclass, field
+from typing import Any, Deque, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from utils.artifacts import (
     atomic_write_json,
-    cached_line_count,
-    count_lines,
     read_json_or_none,
     store_line_count,
 )
+
+_ID_PATTERN = re.compile(rb'"id"\s*:\s*"([^"]*)"')
 
 PASSAGES_MANIFEST_SCHEMA = 1
 # Anserini indexes every file in the directory passed as -input, so the manifest
@@ -97,6 +99,9 @@ class PhaseADecision:
     reason: str
     manifest: PassagesManifest
     skip_docs: int = 0
+    # Documents whose stored vectors must be checked against the current model
+    # before the file is trusted. Empty whenever a manifest already vouches for it.
+    samples: List["SampledDocument"] = field(default_factory=list)
 
     @property
     def reuses_encoded_corpus(self) -> bool:
@@ -118,18 +123,19 @@ def read_passages_manifest(manifest_path: str) -> Optional[PassagesManifest]:
 
 
 def decide_phase_a(manifest_path: str, passages_path: str, expected: PassagesManifest,
-                   trust_legacy: bool = False) -> PhaseADecision:
+                   trust_legacy: bool = False, sample_size: int = 64) -> PhaseADecision:
     """Pick REUSE, RESUME or REBUILD for the encoding phase.
 
     ``expected`` carries the current configuration (fingerprint, sequence length,
-    quantization, corpus signature); only the cheap checks run here, nothing
-    reads the corpus unless legacy artifacts are explicitly trusted.
+    quantization, corpus signature). With a manifest present this is all cheap
+    stats; only an encoded corpus without one is walked against the corpus, which
+    is the price of recovering an artifact from before manifests existed.
     """
     stored = read_passages_manifest(manifest_path)
     if not os.path.exists(passages_path):
         return PhaseADecision(REBUILD, "no encoded corpus on disk", expected)
     if stored is None:
-        return _decide_legacy(passages_path, expected, trust_legacy)
+        return _decide_legacy(passages_path, expected, trust_legacy, sample_size)
     mismatch = expected.describes_same_run(stored)
     if mismatch is not None:
         return PhaseADecision(REBUILD, f"manifest does not match the current run: {mismatch}", expected)
@@ -152,32 +158,148 @@ def decide_phase_a(manifest_path: str, passages_path: str, expected: PassagesMan
     )
 
 
-def _decide_legacy(passages_path: str, expected: PassagesManifest, trust_legacy: bool) -> PhaseADecision:
-    """Handle an encoded corpus written before manifests existed."""
-    if not trust_legacy:
-        return PhaseADecision(
-            REBUILD,
-            "no manifest next to the encoded corpus, so the model and max_seq_length behind it are unknown "
-            "(set PIRB_TRUST_LEGACY_ARTIFACTS=1 to trust it)",
-            expected,
-        )
-    corpus_doc_count = expected.corpus_doc_count
-    if corpus_doc_count is None and expected.corpus_path:
-        corpus_doc_count = cached_line_count(expected.corpus_path)
-    if corpus_doc_count is None:
-        return PhaseADecision(REBUILD, "legacy artifacts trusted, but the corpus size is unknown", expected)
-    written = count_lines(passages_path)
-    if written != corpus_doc_count:
-        return PhaseADecision(
-            REBUILD, f"legacy encoded corpus has {written} of {corpus_doc_count} documents", expected
-        )
-    migrated = PassagesManifest(**expected.to_dict())
-    migrated.corpus_doc_count = corpus_doc_count
-    migrated.written_doc_count = written
-    migrated.written_bytes = os.path.getsize(passages_path)
-    migrated.last_doc_id = _last_document_id(passages_path)
-    migrated.complete = True
-    return PhaseADecision(REUSE, f"legacy encoded corpus trusted with {written} documents", migrated)
+def _decide_legacy(passages_path: str, expected: PassagesManifest, trust_legacy: bool,
+                   sample_size: int) -> PhaseADecision:
+    """Reconstruct a manifest for an encoded corpus written before manifests existed.
+
+    Interrupted runs left behind partially encoded corpora with nothing recording
+    how far they got - for msmarco-pl that is hours of GPU time. The order is
+    recoverable even so: passages.jsonl is written in corpus order, so walking
+    both files side by side and comparing ids establishes how many documents are
+    trustworthy. What the file cannot tell us is which model produced it, which
+    is why the caller still has to check a sample of the vectors before appending
+    to it.
+    """
+    if not expected.corpus_path or not os.path.exists(expected.corpus_path):
+        return PhaseADecision(REBUILD, "no manifest and no corpus to line the encoded corpus up against", expected)
+    adoption = adopt_legacy_passages(passages_path, expected.corpus_path, sample_size=sample_size)
+    if not adoption.ok:
+        return PhaseADecision(REBUILD, f"cannot adopt the encoded corpus: {adoption.reason}", expected)
+    adopted = PassagesManifest(**expected.to_dict())
+    adopted.written_doc_count = adoption.written_doc_count
+    adopted.written_bytes = adoption.written_bytes
+    adopted.last_doc_id = adoption.last_doc_id
+    adopted.complete = adoption.complete
+    if adoption.complete:
+        adopted.corpus_doc_count = adoption.written_doc_count
+    action = REUSE if adoption.complete else RESUME
+    state = "complete" if adoption.complete else "partial"
+    return PhaseADecision(
+        action, f"adopted a {state} encoded corpus of {adoption.written_doc_count} documents without a manifest",
+        adopted, skip_docs=0 if adoption.complete else adoption.written_doc_count,
+        # Nothing on disk says which model wrote those vectors: re-encoding a
+        # sample is the only way to find out, and skipping it is opt-in.
+        samples=[] if trust_legacy else adoption.samples,
+    )
+
+
+@dataclass
+class LegacyAdoption:
+    ok: bool
+    reason: str
+    written_doc_count: int = 0
+    written_bytes: int = 0
+    last_doc_id: Optional[str] = None
+    complete: bool = False
+    samples: List["SampledDocument"] = None
+
+
+@dataclass
+class SampledDocument:
+    """A document whose stored vector can be compared against a fresh encoding."""
+
+    index: int
+    doc_id: str
+    text: str
+    vector: Dict[str, Any]
+
+
+def _extract_id(line: bytes, scan_bytes: int = 512) -> Optional[str]:
+    """Pull the id out of a JSONL line without parsing the whole document.
+
+    Corpus lines carry the passage text, so parsing every one of nine million of
+    them would dominate the cost of lining the two files up.
+    """
+    match = _ID_PATTERN.search(line[:scan_bytes])
+    if match is not None:
+        return match.group(1).decode("utf-8", errors="replace")
+    try:
+        value = json.loads(line.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    doc_id = value.get("id") if isinstance(value, dict) else None
+    return str(doc_id) if doc_id is not None else None
+
+
+def adopt_legacy_passages(passages_path: str, corpus_path: str, sample_size: int = 64,
+                          text_field: str = "contents") -> LegacyAdoption:
+    """Walk an unlabelled encoded corpus against the corpus it came from.
+
+    Returns how many leading documents line up by id, where the trustworthy part
+    of the file ends, and a sample of documents for the caller to verify against
+    the current model.
+    """
+    half = max(1, sample_size // 2)
+    head: List[Tuple[int, bytes, bytes]] = []
+    tail: Deque[Tuple[int, bytes, bytes]] = deque(maxlen=half)
+    count, offset, last_id = 0, 0, None
+    with open(passages_path, "rb") as passages_file, open(corpus_path, "rb") as corpus_file:
+        while True:
+            line = passages_file.readline()
+            if not line:
+                break
+            if not line.endswith(b"\n"):
+                logging.info("Ignoring a torn last line of %s (%d bytes)", passages_path, len(line))
+                break
+            doc_id = _extract_id(line)
+            if doc_id is None:
+                logging.info("Ignoring an unreadable line %d of %s", count + 1, passages_path)
+                break
+            corpus_line = corpus_file.readline()
+            if not corpus_line:
+                return LegacyAdoption(False, f"the encoded corpus holds more than the {count} documents of the corpus")
+            corpus_id = _extract_id(corpus_line)
+            if corpus_id != doc_id:
+                return LegacyAdoption(
+                    False, f"document {count + 1} is {doc_id!r} but the corpus has {corpus_id!r}"
+                )
+            if len(head) < half:
+                head.append((count, line, corpus_line))
+            else:
+                tail.append((count, line, corpus_line))
+            count += 1
+            offset += len(line)
+            last_id = doc_id
+        complete = not corpus_file.readline()
+    if count == 0:
+        return LegacyAdoption(False, "no usable document in the encoded corpus")
+    samples = _build_samples(head, tail, text_field)
+    if not samples:
+        return LegacyAdoption(False, "no document could be sampled for verification")
+    return LegacyAdoption(True, "lined up against the corpus", count, offset, last_id, complete, samples)
+
+
+def _build_samples(head, tail, text_field: str) -> List[SampledDocument]:
+    """Parse the sampled lines, preferring long documents.
+
+    A different max_seq_length only shows up on documents long enough to be
+    truncated, so the longest samples are the informative ones.
+    """
+    samples = []
+    for index, passages_line, corpus_line in list(head) + list(tail):
+        document = _parse_document(passages_line)
+        if document is None:
+            continue
+        try:
+            corpus_document = json.loads(corpus_line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        text = corpus_document.get(text_field) if isinstance(corpus_document, dict) else None
+        if not isinstance(text, str):
+            continue
+        samples.append(SampledDocument(index, str(document["id"]), text, document["vector"]))
+    samples.sort(key=lambda sample: len(sample.text), reverse=True)
+    return samples
 
 
 def _last_document_id(passages_path: str) -> Optional[str]:

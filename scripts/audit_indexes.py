@@ -227,10 +227,12 @@ def print_report(audit: Audit, fixing: bool) -> None:
     freed = sum(report.size_bytes for report in broken)
     removed_passages = [report for report in audit.passages if report.action == "removed"]
     freed += sum(report.size_bytes for report in removed_passages)
-    reencode = [report for report in audit.passages if report.verdict != COMPLETE]
+    incomplete = [report for report in audit.passages if report.verdict != COMPLETE]
     verb = "freed" if fixing else "would be freed"
     print(f"\n{len(broken)} broken index(es), {freed / 1e9:.2f} GB {verb}")
-    print(f"{len(reencode)} task(s) would need re-encoding, {len(broken)} index rebuild(s)")
+    # A partial encoded corpus is resumed from where it stopped rather than
+    # recomputed, as long as it still lines up with its corpus.
+    print(f"{len(incomplete)} incomplete encoded corpus/corpora to resume, {len(broken)} index rebuild(s)")
     if not fixing and (broken or removed_passages):
         print("Nothing was changed; re-run with --fix to apply.")
 
