@@ -64,3 +64,39 @@ def test_build_batches_use_the_index_batch_size(tmp_path, monkeypatch):
     index.build([IndexInput(str(i), f"text {i}") for i in range(10)])
 
     assert sizes == [4, 4, 2]
+
+
+def test_the_task_corpus_is_passed_to_the_index(tmp_path):
+    """AutoIndex is the only place that knows which corpus a task streams."""
+    import os
+    from types import SimpleNamespace
+    from data import RetrievalTask
+    from search import AutoIndex
+
+    task = RetrievalTask("nq-pl", "web")
+    args = SimpleNamespace(cache_dir=str(tmp_path / "cache"), data_dir=str(tmp_path / "data"),
+                           use_bettertransformer=False, rerank_limit=None)
+
+    index = AutoIndex.from_config({"name": "some/model", "type": "splade"}, task, args)
+
+    assert index.task_id == "nq-pl"
+    assert index.corpus_path == os.path.join(str(tmp_path / "data"), "nq-pl", "passages/passages.jsonl")
+
+
+def test_a_task_with_its_own_corpus_layout_is_respected(tmp_path):
+    """PolEval and symmetric tasks keep their passages somewhere else."""
+    import os
+    from types import SimpleNamespace
+    from data import RetrievalTask
+    from search import AutoIndex
+
+    class ElsewhereTask(RetrievalTask):
+        def passages_path(self, data_dir):
+            return os.path.join(data_dir, "poleval-2022", "wiki", "passages/passages.jsonl")
+
+    args = SimpleNamespace(cache_dir=str(tmp_path / "cache"), data_dir="data",
+                           use_bettertransformer=False, rerank_limit=None)
+
+    index = AutoIndex.from_config({"name": "some/model", "type": "splade"}, ElsewhereTask("pl", "web"), args)
+
+    assert index.corpus_path == os.path.join("data", "poleval-2022", "wiki", "passages/passages.jsonl")

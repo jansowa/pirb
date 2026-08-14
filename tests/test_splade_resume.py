@@ -187,6 +187,35 @@ def test_a_partial_corpus_without_a_manifest_is_still_resumed(root):
     assert result["complete"] is True
 
 
+def test_a_rejected_resume_still_encodes_the_whole_corpus(root):
+    """A rejected resume must not silently drop the documents it skipped.
+
+    skip_documents consumes the passage stream before it can notice that the
+    corpus moved under it, so falling back to a rebuild has to re-read the corpus
+    from the start. Encoding what is left of a partly consumed stream would write
+    an index missing its leading documents and report success.
+    """
+    index, task, data_dir = make_index(str(root))
+    os.makedirs(os.path.dirname(index.docs_path), exist_ok=True)
+    # Ids that parse and line up with the manifest, but not with the corpus.
+    with open(index.docs_path, "w", encoding="utf-8") as passages_file:
+        for i in range(8):
+            passages_file.write(json.dumps({"id": f"other_{i}", "content": "", "vector": {"a": 1}}) + "\n")
+    manifest = index._current_manifest()
+    manifest.written_doc_count = 8
+    manifest.written_bytes = os.path.getsize(index.docs_path)
+    manifest.last_doc_id = "other_7"
+    index._store_manifest(manifest)
+
+    index.build(task.passages(data_dir, verbose=False))
+
+    documents = read_passages(index.docs_path)
+    assert [document["id"] for document in documents] == [f"doc_{i}" for i in range(DOCUMENTS)]
+    assert index.encoder.encoded == DOCUMENTS
+    assert read_passages_manifest(index.manifest_path).written_doc_count == DOCUMENTS
+    assert index.exists() is True
+
+
 def test_a_complete_corpus_without_a_manifest_is_reused(root):
     run_worker(root)
     index = paths(root)

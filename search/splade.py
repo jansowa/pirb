@@ -12,7 +12,7 @@ from pyserini.encode import QueryEncoder
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForMaskedLM, BatchEncoding
 from backend import IndexBackend, SparseBackend
-from data import IndexInput
+from data import IndexInput, RetrievalTask
 from search.base import SearchIndex
 from search.splade_artifacts import (
     REBUILD,
@@ -377,6 +377,7 @@ class SpladeIndex(SearchIndex):
                     logging.info("Skipped %d already encoded document(s): %s", skipped, reason)
                 except ResumeMismatch as error:
                     logging.warning("Cannot resume the splade encoding, rebuilding: %s", error)
+                    docs = self._restart_corpus_stream(error)
             else:
                 logging.warning("Cannot resume the splade encoding, rebuilding: %s", reason)
         if not append:
@@ -397,6 +398,26 @@ class SpladeIndex(SearchIndex):
                     writer.note_batch(len(batch), batch[-1].id)
             final = writer.finalize()
         return final.written_doc_count
+
+    def _restart_corpus_stream(self, error: ResumeMismatch) -> Iterable[IndexInput]:
+        """Read the corpus again after a rejected resume.
+
+        skip_documents consumes the stream before it can notice that the corpus
+        moved, so continuing with the partly consumed one would write an index
+        missing its leading documents - and it would look like a success. Failing
+        the task is the only acceptable alternative to re-reading the corpus.
+        """
+        if not self.corpus_path or not os.path.exists(self.corpus_path):
+            raise error
+        logging.info("Re-reading the corpus %s from the start", self.corpus_path)
+        return self._stream_corpus()
+
+    def _stream_corpus(self) -> Iterable[IndexInput]:
+        """The corpus as RetrievalTask.passages() streams it, line by line."""
+        with open(self.corpus_path, "r", encoding="utf-8") as corpus_file:
+            for line in corpus_file:
+                value = json.loads(line.strip())
+                yield IndexInput(value["id"], value[RetrievalTask.TEXT_FIELD], parent_id=value.get("parentId"))
 
     def _build_index(self, docs_path: str, doc_count: Optional[int]):
         """Build the Lucene index aside and swap it in only once it is complete.
