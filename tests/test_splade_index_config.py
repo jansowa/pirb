@@ -2,7 +2,11 @@
 
 import pytest
 
-pytest.importorskip("pyserini", reason="splade index requires pyserini")
+import _stubs
+
+# The scheduling and configuration logic under test never reaches pyserini, so
+# stubs stand in for it when it is not installed.
+_stubs.install()
 
 from search.splade import SpladeIndex
 
@@ -49,10 +53,11 @@ def test_backend_threads_default_to_eight(tmp_path):
 def test_build_batches_use_the_index_batch_size(tmp_path, monkeypatch):
     from data import IndexInput
 
-    index = _index(tmp_path, batch_size=64, index_batch_size=4)
+    # Built inline so that the stubbed backend cannot outlive the monkeypatch.
+    index = _index(tmp_path, batch_size=64, index_batch_size=4, index_build_workers=0)
     index.encoder = object()
     monkeypatch.setattr(index, "_get_encoder", lambda: index.encoder)
-    monkeypatch.setattr(index.backend, "build", lambda docs_path: None)
+    monkeypatch.setattr(index.backend, "build", lambda docs_path, target_dir=None: None)
     sizes = []
     monkeypatch.setattr(index, "_write_batch", lambda batch, output: sizes.append(len(batch)))
 

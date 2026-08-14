@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("pyserini", reason="run_benchmark requires pyserini")
+import _stubs
+
+# The scheduling and configuration logic under test never reaches pyserini, so
+# stubs stand in for it when it is not installed.
+_stubs.install()
 
 import run_benchmark
 from data import IndexInput

@@ -7,11 +7,16 @@ import time
 
 import pytest
 
-pytest.importorskip("pyserini", reason="splade index requires pyserini")
+import _stubs
+
+# The scheduling and configuration logic under test never reaches pyserini, so
+# stubs stand in for it when it is not installed.
+_stubs.install()
 
 import search.splade as splade_module
 from data import IndexInput
 from search.splade import SpladeIndex
+from utils.artifacts import read_index_manifest
 
 
 @pytest.fixture(autouse=True)
@@ -29,11 +34,22 @@ def _index(tmp_path, name="model", **config):
     index.encoder = SimpleNamespace()
     index._get_encoder = lambda: index.encoder
     index._write_batch = lambda batch, output: None
+    # These tests care about scheduling, not about Lucene: an index is "complete"
+    # when the build wrote its manifest. Validating the count is covered by
+    # tests/test_lucene_backend_complete.py.
+    index.backend.num_docs = lambda: (read_index_manifest(index.backend.index_dir) or {}).get("doc_count")
     return index
 
 
 def _build(index, backend_build, documents=2):
-    index.backend.build = backend_build
+    def build(docs_path, target_dir=None):
+        directory = target_dir or index.index_dir
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "segments_1"), "w", encoding="utf-8") as segments:
+            segments.write("segments")
+        return backend_build(docs_path)
+
+    index.backend.build = build
     index.build([IndexInput(str(i), f"text {i}") for i in range(documents)])
 
 
@@ -161,7 +177,10 @@ def test_a_shared_index_directory_is_not_removed_under_a_running_build(tmp_path)
 
     first = _index(tmp_path, name="shared")
     _build(first, slow_build)
-    assert os.path.isdir(first.index_dir)
+    # The index is staged aside and renamed into place only once it is finished,
+    # so nothing at the final path can be mistaken for a usable index yet.
+    assert not os.path.isdir(first.index_dir)
+    assert [name for name in os.listdir(first.base_dir) if ".tmp-" in name]
 
     # A second index over the same cache directory, as tasks sharing a cache do.
     second = _index(tmp_path, name="shared")
@@ -176,6 +195,8 @@ def test_a_shared_index_directory_is_not_removed_under_a_running_build(tmp_path)
     time.sleep(0.2)
     released.set()
     thread.join(5)
+    # The second build is backgrounded too, so wait for it before ordering.
+    second.wait_for_build()
 
     assert order.index("first-build-done") < order.index("second-build-done")
 
