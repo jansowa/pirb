@@ -33,7 +33,12 @@ class AutoIndex:
             return HybridIndex(args.data_dir, index_name, indices, k0, strategy, task, rerank_limit, use_bt)
         elif index_type == "splade":
             from .splade import SpladeIndex
-            return SpladeIndex(config, data_dir=cache_dir, use_bettertransformer=use_bt)
+            # The corpus behind the passage stream is what makes an interrupted
+            # encoding resumable, so it is passed along with the config.
+            return SpladeIndex(
+                config, data_dir=cache_dir, use_bettertransformer=use_bt,
+                task_id=task.task_id, corpus_path=task.passages_path(args.data_dir),
+            )
         elif index_name in ("sparse", "bm25"):
             from .lucene import LuceneIndex
             lang = config.get("lang", "pl")

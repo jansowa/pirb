@@ -14,6 +14,30 @@ from transformers import AutoTokenizer, AutoModelForMaskedLM, BatchEncoding
 from backend import IndexBackend, SparseBackend
 from data import IndexInput
 from search.base import SearchIndex
+from search.splade_artifacts import (
+    REBUILD,
+    RESUME,
+    REUSE,
+    PassagesManifest,
+    PassagesWriter,
+    PhaseADecision,
+    ResumeMismatch,
+    decide_phase_a,
+    passages_manifest_path,
+    read_passages_manifest,
+    prepare_resume,
+    skip_documents,
+)
+from utils.artifacts import (
+    atomic_write_json,
+    cached_line_count,
+    corpus_signature,
+    model_fingerprint,
+    remove_stale_dirs,
+    temporary_dir_name,
+    trust_legacy_artifacts,
+    write_index_manifest,
+)
 
 # Encoding a corpus needs the GPU and building a Lucene index needs the CPU, so
 # the two phases of different tasks can run at the same time. The pool is shared
@@ -140,7 +164,8 @@ class SpladeEncoder(QueryEncoder):
 
 class SpladeIndex(SearchIndex):
 
-    def __init__(self, config: Dict, data_dir: str, use_bettertransformer: bool = False):
+    def __init__(self, config: Dict, data_dir: str, use_bettertransformer: bool = False,
+                 task_id: Optional[str] = None, corpus_path: Optional[str] = None):
         # Queries are a handful of tokens while passages are encoded at
         # max_seq_length, so the corpus batch size can be tuned separately.
         self.batch_size = int(config.get("batch_size", 32))
@@ -152,8 +177,19 @@ class SpladeIndex(SearchIndex):
         self.index_name = self.model_name_or_path.replace("/", "_").replace(".", "_")
         self.base_dir = os.path.join(self.data_dir, self.index_name)
         self.index_dir = os.path.join(self.base_dir, f"{self._get_backend_name(config)}_index")
+        self.docs_dir = os.path.join(self.base_dir, "docs")
+        self.docs_path = os.path.join(self.docs_dir, "passages.jsonl")
+        # Kept outside docs/: LuceneBackend.build() hands Anserini the whole
+        # directory as -input, so any *.json left there ends up in the index.
+        self.manifest_path = passages_manifest_path(self.base_dir)
+        self.task_id = task_id
+        self.corpus_path = corpus_path
         self.use_bettertransformer = use_bettertransformer
         self.quantization_factor = config.get("quantization_factor", 100)
+        self.max_seq_length = config.get("max_seq_length", 512)
+        # How often the encoding manifest is rewritten, in batches. More often
+        # means less re-encoding after a kill and more small atomic writes.
+        self.manifest_flush_batches = max(1, int(config.get("manifest_flush_batches", 100)))
         self.threads = config.get("threads", 8)
         # Number of Lucene indexes that may be built in the background at once.
         # 0 keeps the index build inline, exactly as before.
@@ -182,6 +218,8 @@ class SpladeIndex(SearchIndex):
         if backend["backend_type"] == "lucene":
             # noinspection PyTypeChecker
             backend["encoder_provider"] = self._get_encoder
+            # noinspection PyTypeChecker
+            backend["expected_doc_count_provider"] = self._expected_doc_count
         return IndexBackend.from_config(backend)
 
     def _get_encoder(self):
@@ -200,9 +238,10 @@ class SpladeIndex(SearchIndex):
             pending.result()
 
     def exists(self) -> bool:
-        # An index that is still being written is not usable yet.
+        # An index that is still being written, or was left half-written by a
+        # killed job, is not usable yet.
         self.wait_for_build()
-        return self.backend.exists()
+        return self.backend.is_complete()
 
     def build(self, docs: Iterable[IndexInput]):
         # Another index object may be writing into the same directory when
@@ -211,32 +250,129 @@ class SpladeIndex(SearchIndex):
             concurrent_build = _ACTIVE_BUILDS.get(self.index_dir)
         if concurrent_build is not None:
             concurrent_build.result()
-        if self.exists(): shutil.rmtree(self.index_dir)
-        if self.encoder is None: self._get_encoder()
-        docs_dir = os.path.join(self.base_dir, "docs")
-        docs_path = os.path.join(docs_dir, "passages.jsonl")
-        os.makedirs(docs_dir, exist_ok=True)
+        self.wait_for_build()
+        os.makedirs(self.docs_dir, exist_ok=True)
+        remove_stale_dirs(self.index_dir)
         logging.info("Building splade vectors index %s", self.index_dir)
-        with open(docs_path, "w", encoding='utf-8') as docs_file:
+        decision = self._decide_phase_a()
+        logging.info(
+            "Splade encoding for %s: %s (%s), %d document(s) already encoded",
+            self.index_dir, decision.action.upper(), decision.reason, decision.skip_docs,
+        )
+        if decision.action == REUSE:
+            doc_count = decision.manifest.written_doc_count
+            self._store_manifest(decision.manifest)
+        else:
+            doc_count = self._encode_corpus(docs, decision)
+        if self.index_build_workers <= 0:
+            self._build_index(self.docs_path, doc_count)
+            return
+        self._pending_build = self._submit_build(self.docs_path, doc_count)
+
+    def _current_manifest(self) -> PassagesManifest:
+        """The manifest that describes what this run would encode."""
+        corpus_size, corpus_mtime = corpus_signature(self.corpus_path)
+        return PassagesManifest(
+            task_id=self.task_id,
+            model_path=self.model_name_or_path,
+            model_fingerprint=model_fingerprint(self.model_name_or_path),
+            max_seq_length=self.max_seq_length,
+            quantization_factor=self.quantization_factor,
+            corpus_path=self.corpus_path,
+            corpus_size_bytes=corpus_size,
+            corpus_mtime=corpus_mtime,
+            # Never counted here: phase A streams the whole corpus anyway, so
+            # the count is recorded once it finishes.
+            corpus_doc_count=cached_line_count(self.corpus_path, compute=False) if self.corpus_path else None,
+        )
+
+    def _decide_phase_a(self) -> PhaseADecision:
+        expected = self._current_manifest()
+        if self.corpus_path is None:
+            # Without the corpus behind the stream nothing can be verified.
+            return PhaseADecision(REBUILD, "the corpus path of this task is unknown", expected)
+        return decide_phase_a(self.manifest_path, self.docs_path, expected, trust_legacy=trust_legacy_artifacts())
+
+    def _expected_doc_count(self) -> Optional[int]:
+        """How many documents a complete index of this task should hold.
+
+        Only used to validate indexes built before manifests existed, so reading
+        the corpus once (cached next to it) is acceptable here.
+        """
+        manifest = read_passages_manifest(self.manifest_path)
+        if manifest is not None and manifest.complete:
+            return manifest.written_doc_count
+        if not self.corpus_path:
+            return None
+        return cached_line_count(self.corpus_path)
+
+    def _store_manifest(self, manifest: PassagesManifest):
+        atomic_write_json(self.manifest_path, manifest.to_dict())
+
+    def _encode_corpus(self, docs: Iterable[IndexInput], decision: PhaseADecision) -> int:
+        """Run phase A, appending to a partial file when resuming."""
+        manifest, append, skipped = decision.manifest, False, 0
+        if decision.action == RESUME:
+            ok, reason, manifest = prepare_resume(self.docs_path, decision.manifest)
+            if ok:
+                try:
+                    docs = skip_documents(docs, manifest.written_doc_count, manifest.last_doc_id)
+                    append, skipped = True, manifest.written_doc_count
+                    logging.info("Skipped %d already encoded document(s): %s", skipped, reason)
+                except ResumeMismatch as error:
+                    logging.warning("Cannot resume the splade encoding, rebuilding: %s", error)
+            else:
+                logging.warning("Cannot resume the splade encoding, rebuilding: %s", reason)
+        if not append:
+            manifest = self._current_manifest()
+        if self.encoder is None: self._get_encoder()
+        with PassagesWriter(self.docs_path, self.manifest_path, manifest,
+                            flush_batches=self.manifest_flush_batches, append=append) as writer:
             with torch.no_grad():
                 batch = []
                 for doc in docs:
                     batch.append(doc)
                     if len(batch) >= self.index_batch_size:
-                        self._write_batch(batch, docs_file)
+                        self._write_batch(batch, writer.file)
+                        writer.note_batch(len(batch), batch[-1].id)
                         batch = []
                 if len(batch) > 0:
-                    self._write_batch(batch, docs_file)
-        os.makedirs(self.index_dir, exist_ok=True)
-        if self.index_build_workers <= 0:
-            self.backend.build(docs_path)
-            return
-        self._pending_build = self._submit_build(docs_path)
+                    self._write_batch(batch, writer.file)
+                    writer.note_batch(len(batch), batch[-1].id)
+            final = writer.finalize()
+        return final.written_doc_count
 
-    def _submit_build(self, docs_path: str) -> Future:
+    def _build_index(self, docs_path: str, doc_count: Optional[int]):
+        """Build the Lucene index aside and swap it in only once it is complete.
+
+        The old index stays queryable until the new one is ready, and a killed
+        job leaves a `.tmp-*` directory that nothing mistakes for the index.
+        """
+        target_dir = temporary_dir_name(self.index_dir)
+        moved_aside = None
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            self.backend.build(docs_path, target_dir=target_dir)
+            write_index_manifest(target_dir, doc_count)
+            if os.path.exists(self.index_dir):
+                moved_aside = temporary_dir_name(self.index_dir, kind="old")
+                shutil.rmtree(moved_aside, ignore_errors=True)
+                os.rename(self.index_dir, moved_aside)
+            os.rename(target_dir, self.index_dir)
+        except BaseException:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            if moved_aside is not None and not os.path.exists(self.index_dir):
+                os.rename(moved_aside, self.index_dir)
+                moved_aside = None
+            raise
+        finally:
+            if moved_aside is not None:
+                shutil.rmtree(moved_aside, ignore_errors=True)
+
+    def _submit_build(self, docs_path: str, doc_count: Optional[int] = None) -> Future:
         index_dir = self.index_dir
         executor = _get_build_executor(self.index_build_workers)
-        future = executor.submit(self.backend.build, docs_path)
+        future = executor.submit(self._build_index, docs_path, doc_count)
         with _BUILD_LOCK:
             _ACTIVE_BUILDS[index_dir] = future
 
