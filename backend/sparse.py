@@ -91,6 +91,10 @@ class LuceneBackend(SparseBackend):
             logging.debug("Could not determine the expected document count: %s", error)
             return None
 
-    def num_docs(self) -> Optional[int]:
-        """Documents in the index on disk, or None if it cannot be read."""
-        return lucene_num_docs(self.index_dir)
+    def num_docs(self, index_dir: Optional[str] = None) -> Optional[int]:
+        """Documents in an index on disk, or None if it cannot be read.
+
+        Takes a directory so that a build staged aside can be inspected before it
+        is renamed into place.
+        """
+        return lucene_num_docs(index_dir or self.index_dir)

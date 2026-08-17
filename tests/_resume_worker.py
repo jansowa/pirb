@@ -48,7 +48,7 @@ def make_index(root: str, kill_after_docs=None, kill_in_phase_b=False, drop_docs
     index.encoder = FakeEncoder(os.path.join(root, ENCODER_LOG), kill_after=kill_after_docs, model_tag=model_tag)
     index._get_encoder = lambda: index.encoder
     index.backend.build = fake_backend_build(index, kill_in_phase_b=kill_in_phase_b, drop_docs=drop_docs)
-    index.backend.num_docs = lambda: fake_num_docs(index.backend.index_dir)
+    index.backend.num_docs = lambda index_dir=None: fake_num_docs(index_dir or index.backend.index_dir)
     return index, task, data_dir
 
 

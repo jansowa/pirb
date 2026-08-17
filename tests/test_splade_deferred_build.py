@@ -37,7 +37,8 @@ def _index(tmp_path, name="model", **config):
     # These tests care about scheduling, not about Lucene: an index is "complete"
     # when the build wrote its manifest. Validating the count is covered by
     # tests/test_lucene_backend_complete.py.
-    index.backend.num_docs = lambda: (read_index_manifest(index.backend.index_dir) or {}).get("doc_count")
+    index.backend.num_docs = lambda index_dir=None: (
+        read_index_manifest(index_dir or index.backend.index_dir) or {}).get("doc_count")
     return index
 
 

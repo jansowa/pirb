@@ -419,6 +419,26 @@ class SpladeIndex(SearchIndex):
                 value = json.loads(line.strip())
                 yield IndexInput(value["id"], value[RetrievalTask.TEXT_FIELD], parent_id=value.get("parentId"))
 
+    def _indexed_doc_count(self, index_dir: str, expected: Optional[int]) -> Optional[int]:
+        """What the freshly built index actually holds.
+
+        Recording the indexer's own count, rather than the number of documents it
+        was given, is what keeps a good index from being declared truncated for
+        the rest of its life: an indexer may legitimately drop a document (an
+        empty vector, say), and then a count taken from phase A would never match
+        again. Losing documents outright still shows up here as a warning, and a
+        build killed halfway is caught by the missing manifest, not by this number.
+        """
+        reader = getattr(self.backend, "num_docs", None)
+        actual = reader(index_dir) if reader is not None else None
+        if actual is None:
+            return expected
+        if expected is not None and actual != expected:
+            logging.warning(
+                "Index %s holds %d of the %d documents it was given", index_dir, actual, expected
+            )
+        return actual
+
     def _build_index(self, docs_path: str, doc_count: Optional[int]):
         """Build the Lucene index aside and swap it in only once it is complete.
 
@@ -430,7 +450,7 @@ class SpladeIndex(SearchIndex):
         try:
             os.makedirs(target_dir, exist_ok=True)
             self.backend.build(docs_path, target_dir=target_dir)
-            write_index_manifest(target_dir, doc_count)
+            write_index_manifest(target_dir, self._indexed_doc_count(target_dir, doc_count), doc_count)
             if os.path.exists(self.index_dir):
                 moved_aside = temporary_dir_name(self.index_dir, kind="old")
                 shutil.rmtree(moved_aside, ignore_errors=True)

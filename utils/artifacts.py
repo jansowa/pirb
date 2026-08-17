@@ -146,11 +146,18 @@ def index_manifest_path(index_dir: str) -> str:
     return os.path.join(index_dir, INDEX_MANIFEST_NAME)
 
 
-def write_index_manifest(index_dir: str, doc_count: Optional[int]) -> None:
-    """Record how many documents a finished index is supposed to hold."""
+def write_index_manifest(index_dir: str, doc_count: Optional[int],
+                         expected_doc_count: Optional[int] = None) -> None:
+    """Record how many documents a finished index holds.
+
+    ``doc_count`` is what the index reports once built, which is what later runs
+    compare against; ``expected_doc_count`` keeps the number of documents handed
+    to the indexer, for the cases where an indexer drops some of them.
+    """
     atomic_write_json(index_manifest_path(index_dir), {
         "schema_version": INDEX_MANIFEST_SCHEMA,
         "doc_count": doc_count,
+        "expected_doc_count": expected_doc_count if expected_doc_count is not None else doc_count,
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
 

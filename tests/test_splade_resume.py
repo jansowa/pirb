@@ -240,3 +240,20 @@ def test_a_corpus_encoded_by_another_model_is_recomputed(root):
     assert result["encoded_here"] == DOCUMENTS + SAMPLE_SIZE, "a foreign encoding must not be appended to"
     assert encoded_documents(str(root / ENCODER_LOG)) == encoded_before + DOCUMENTS + SAMPLE_SIZE
     assert read_passages(index.docs_path)[0]["vector"], "the file was rewritten by the current model"
+
+
+def test_an_indexer_that_drops_documents_does_not_look_truncated(root):
+    """Anserini may index fewer documents than it was given.
+
+    Comparing a later run against phase A's count would then mark a healthy index
+    truncated for good and rebuild it on every job.
+    """
+    result = run_worker(root, "--drop-docs", "3")
+    index = paths(root)
+
+    manifest = read_index_manifest(index.index_dir)
+    assert manifest["doc_count"] == DOCUMENTS - 3, "the count recorded is the one the index reports"
+    assert manifest["expected_doc_count"] == DOCUMENTS, "what phase A wrote is kept for diagnosis"
+    assert result["complete"] is True
+
+    assert run_worker(root)["skipped_build"] is True, "nothing may be rebuilt on the next run"
