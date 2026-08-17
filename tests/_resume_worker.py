@@ -29,9 +29,15 @@ TASK_ID = "resume-task"
 
 def make_index(root: str, kill_after_docs=None, kill_in_phase_b=False, drop_docs=0,
                index_batch_size=10, manifest_flush_batches=1, model_dir=None,
-               model_tag="m1", legacy_sample_size=4):
+               model_tag="m1", legacy_sample_size=4, corpus_path=None, cache_name=TASK_ID):
+    """Build a SpladeIndex over a fake encoder and a fake Lucene backend.
+
+    ``cache_name`` is the cache directory the index lives in. Several tasks share
+    one in the real benchmark - the PolEval splits all map to
+    poleval-2022-<domain> - so it has to be settable independently of the corpus.
+    """
     data_dir = os.path.join(root, "data")
-    cache_dir = os.path.join(root, "cache", TASK_ID)
+    cache_dir = os.path.join(root, "cache", cache_name)
     model_dir = model_dir or os.path.join(root, "model")
     task = RetrievalTask(TASK_ID, "test")
     config = {
@@ -44,7 +50,7 @@ def make_index(root: str, kill_after_docs=None, kill_in_phase_b=False, drop_docs
         "legacy_sample_size": legacy_sample_size,
     }
     index = SpladeIndex(config, data_dir=cache_dir, task_id=TASK_ID,
-                        corpus_path=task.passages_path(data_dir))
+                        corpus_path=corpus_path or task.passages_path(data_dir))
     index.encoder = FakeEncoder(os.path.join(root, ENCODER_LOG), kill_after=kill_after_docs, model_tag=model_tag)
     index._get_encoder = lambda: index.encoder
     index.backend.build = fake_backend_build(index, kill_in_phase_b=kill_in_phase_b, drop_docs=drop_docs)

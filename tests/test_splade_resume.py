@@ -257,3 +257,55 @@ def test_an_indexer_that_drops_documents_does_not_look_truncated(root):
     assert result["complete"] is True
 
     assert run_worker(root)["skipped_build"] is True, "nothing may be rebuilt on the next run"
+
+
+def _stream(path):
+    """The corpus as RetrievalTask.passages() streams it, as a generator."""
+    from data import IndexInput
+    with open(path, encoding="utf-8") as corpus_file:
+        for line in corpus_file:
+            value = json.loads(line)
+            yield IndexInput(value["id"], value["contents"])
+
+
+def test_tasks_sharing_a_cache_directory_reuse_the_same_encoded_corpus(root):
+    """Several PolEval splits map to one cache directory over one corpus.
+
+    pirb-without-private.json puts dev-0, test-A and test-B of a domain in
+    poleval-2022-<domain>, so the second and third of them must find the corpus
+    already encoded rather than encode it again.
+    """
+    corpus = str(root / "data" / TASK_ID / "passages" / "passages.jsonl")
+    first, _task, _data_dir = make_index(str(root), cache_name="shared-domain", corpus_path=corpus)
+    first.build(_stream(corpus))
+    encoded_after_first = encoded_documents(str(root / ENCODER_LOG))
+    assert encoded_after_first == DOCUMENTS
+
+    second, _task, _data_dir = make_index(str(root), cache_name="shared-domain", corpus_path=corpus)
+    assert second.exists() is True, "the index built by the first split must count as ready"
+    second.build(_stream(corpus))
+
+    assert encoded_documents(str(root / ENCODER_LOG)) == encoded_after_first, \
+        "a split sharing the cache must not re-encode the corpus"
+    assert read_passages_manifest(second.manifest_path).written_doc_count == DOCUMENTS
+
+
+def test_a_different_corpus_in_a_shared_cache_directory_is_not_reused(root):
+    """The dangerous half of sharing a cache directory.
+
+    Reusing an encoded corpus because the directory happens to hold one would put
+    another task's vectors into this task's index, and the results would merely
+    look worse rather than fail.
+    """
+    corpus = str(root / "data" / TASK_ID / "passages" / "passages.jsonl")
+    first, _task, _data_dir = make_index(str(root), cache_name="shared-domain", corpus_path=corpus)
+    first.build(_stream(corpus))
+
+    other_corpus = str(root / "data" / "other" / "passages.jsonl")
+    write_corpus(other_corpus, 40, prefix="other")
+    second, _task, _data_dir = make_index(str(root), cache_name="shared-domain", corpus_path=other_corpus)
+    second.build(_stream(other_corpus))
+
+    documents = read_passages(second.docs_path)
+    assert [document["id"] for document in documents] == [f"other_{i}" for i in range(40)]
+    assert read_passages_manifest(second.manifest_path).corpus_path == other_corpus
