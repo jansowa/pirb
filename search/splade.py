@@ -92,6 +92,14 @@ class SpladeEncoder(QueryEncoder):
         self.model_name_or_path = config["name"]
         self.maxlen = config.get("max_seq_length", 512)
         self.model_kwargs = config.get("model_kwargs", {})
+        # pyserini >= 0.22 hands query weights to Anserini as Java ints
+        # (LuceneImpactSearcher does `JInt(weight)`), so the float weights this
+        # encoder returns are floor-truncated: every term below 1.0 vanishes and
+        # the rest collapse to 1, 2, 3. Older pyserini used JFloat and kept them.
+        # With this flag the query side is quantized like the document side
+        # (round(w * quantization_factor), zeros dropped), which gives the
+        # integer-weight search the same ranking the float weights would.
+        self.quantize_queries = bool(config.get("quantize_queries", False))
         self.tokenizer, self.model = self._init_tokenizer_and_model()
         self.vocab = {v: k for k, v in self.tokenizer.get_vocab().items()}
         self.queries_cache = {}
@@ -166,7 +174,11 @@ class SpladeEncoder(QueryEncoder):
         for aggregated_logits in batch_aggregated_logits:
             col = np.nonzero(aggregated_logits)[0]
             weights = aggregated_logits[col]
-            outputs = [(self.vocab[k], float(v)) for k, v in zip(list(col), list(weights))]
+            if self.quantize_queries:
+                weights = np.rint(np.asarray(weights, dtype=np.float32) * self.quantization_factor).astype(int)
+                outputs = [(self.vocab[k], int(v)) for k, v in zip(list(col), list(weights)) if v > 0]
+            else:
+                outputs = [(self.vocab[k], float(v)) for k, v in zip(list(col), list(weights))]
             outputs = sorted(outputs, key=lambda v: -v[1])[:max_clauses]
             d = {k: v for k, v in outputs}
             to_return.append(d)
