@@ -102,6 +102,9 @@ class SpladeEncoder(QueryEncoder):
         self.quantize_queries = bool(config.get("quantize_queries", False))
         self.tokenizer, self.model = self._init_tokenizer_and_model()
         self.vocab = {v: k for k, v in self.tokenizer.get_vocab().items()}
+        # Some MLM heads are padded past the tokenizer (pl-ModernBERT: 50 008 logits, 50 002 tokens);
+        # those dimensions have no term and are dropped from the index and the queries.
+        self.vocab_size = len(self.tokenizer.get_vocab())
         self.queries_cache = {}
 
     def _init_tokenizer_and_model(self):
@@ -146,7 +149,7 @@ class SpladeEncoder(QueryEncoder):
         data = np.rint(data * self.quantization_factor).astype(int)
         dict_splade = dict()
         for id_token, value_token in zip(idx[0], data):
-            if value_token > 0:
+            if value_token > 0 and id_token < self.vocab_size:
                 real_token = self.vocab[id_token]
                 dict_splade[real_token] = int(value_token)
         return dict_splade
@@ -176,9 +179,9 @@ class SpladeEncoder(QueryEncoder):
             weights = aggregated_logits[col]
             if self.quantize_queries:
                 weights = np.rint(np.asarray(weights, dtype=np.float32) * self.quantization_factor).astype(int)
-                outputs = [(self.vocab[k], int(v)) for k, v in zip(list(col), list(weights)) if v > 0]
+                outputs = [(self.vocab[k], int(v)) for k, v in zip(list(col), list(weights)) if v > 0 and k < self.vocab_size]
             else:
-                outputs = [(self.vocab[k], float(v)) for k, v in zip(list(col), list(weights))]
+                outputs = [(self.vocab[k], float(v)) for k, v in zip(list(col), list(weights)) if k < self.vocab_size]
             outputs = sorted(outputs, key=lambda v: -v[1])[:max_clauses]
             d = {k: v for k, v in outputs}
             to_return.append(d)
