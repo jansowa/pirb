@@ -49,6 +49,13 @@ _BUILD_EXECUTOR: Optional[ThreadPoolExecutor] = None
 _ACTIVE_BUILDS: Dict[str, Future] = {}
 
 
+def _numpy_compatible(tensor: torch.Tensor):
+    """NumPy cannot consume BF16; preserve the existing FP16/FP32 quantization."""
+    if tensor.dtype == torch.bfloat16:
+        tensor = tensor.float()
+    return tensor.cpu().numpy()
+
+
 def _top_token_overlap(stored: Dict, fresh: Dict, top_k: int) -> float:
     """Share of the strongest tokens of two splade vectors that agree."""
     def strongest(vector: Dict):
@@ -143,7 +150,7 @@ class SpladeEncoder(QueryEncoder):
         return result
 
     def encode_document_vector(self, splade_vector: torch.Tensor):
-        data = splade_vector.cpu().numpy()
+        data = _numpy_compatible(splade_vector)
         idx = np.nonzero(data)
         data = data[idx]
         data = np.rint(data * self.quantization_factor).astype(int)
@@ -162,7 +169,7 @@ class SpladeEncoder(QueryEncoder):
         for i in range(0, len(queries), batch_size):
             batch = queries[i:i + batch_size]
             ids_batch = query_ids[i:i + batch_size]
-            encoded = self.encode_batch(batch).cpu().numpy()
+            encoded = _numpy_compatible(self.encode_batch(batch))
             outputs = self._output_to_weight_dicts(encoded)
             assert len(batch) == len(outputs)
             cached.update({text: output for text, output in zip(batch, outputs)})
