@@ -120,7 +120,9 @@ class SpladeEncoder(QueryEncoder):
             torch_dtype = torch.float16
         elif self.config.get("bf16", False):
             torch_dtype = torch.bfloat16
-        model_kwargs = {"torch_dtype": torch_dtype}
+        # Meta-device loading preserves RoBERTa's tied decoder bias in FP32
+        # (ordinary loading in Transformers 4.48 can silently zero it).
+        model_kwargs = {"torch_dtype": torch_dtype, "device_map": "cpu"}
         model_kwargs.update(self.model_kwargs)
         tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
         model = AutoModelForMaskedLM.from_pretrained(self.model_name_or_path, **model_kwargs).to(self.device)
