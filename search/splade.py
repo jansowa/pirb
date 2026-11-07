@@ -100,6 +100,10 @@ class SpladeEncoder(QueryEncoder):
         # (round(w * quantization_factor), zeros dropped), which gives the
         # integer-weight search the same ranking the float weights would.
         self.quantize_queries = bool(config.get("quantize_queries", False))
+        # Terms whose weight (after log1p-relu-max pooling) is below this are
+        # dropped from documents and queries before quantization. 0 keeps the
+        # usual rule (round(w * quantization_factor) > 0, i.e. w >= 0.005 at 100).
+        self.min_weight = float(config.get("min_weight", 0.0))
         self.tokenizer, self.model = self._init_tokenizer_and_model()
         self.vocab = {v: k for k, v in self.tokenizer.get_vocab().items()}
         # Some MLM heads are padded past the tokenizer (pl-ModernBERT: 50 008 logits, 50 002 tokens);
@@ -144,6 +148,8 @@ class SpladeEncoder(QueryEncoder):
 
     def encode_document_vector(self, splade_vector: torch.Tensor):
         data = splade_vector.cpu().numpy()
+        if self.min_weight > 0:
+            data = np.where(data >= self.min_weight, data, 0)
         idx = np.nonzero(data)
         data = data[idx]
         data = np.rint(data * self.quantization_factor).astype(int)
@@ -175,6 +181,8 @@ class SpladeEncoder(QueryEncoder):
         if len(batch_aggregated_logits.shape) == 1:
             batch_aggregated_logits = [batch_aggregated_logits]
         for aggregated_logits in batch_aggregated_logits:
+            if self.min_weight > 0:
+                aggregated_logits = np.where(aggregated_logits >= self.min_weight, aggregated_logits, 0)
             col = np.nonzero(aggregated_logits)[0]
             weights = aggregated_logits[col]
             if self.quantize_queries:
@@ -226,8 +234,13 @@ class SpladeIndex(SearchIndex):
         # Number of Lucene indexes that may be built in the background at once.
         # 0 keeps the index build inline, exactly as before.
         self.index_build_workers = max(0, int(config.get("index_build_workers", 1)))
+        # Asymmetric evaluation: the index is built with `name`, the queries are
+        # encoded with `query_model` (a student used as the query encoder over
+        # the big model's index). Unset = the same model on both sides.
+        self.query_model_name_or_path = config.get("query_model")
         self.backend = self._create_backend(config)
         self.encoder: Optional[SpladeEncoder] = None
+        self.query_encoder: Optional[SpladeEncoder] = None
         self.searcher = None
         self._pending_build: Optional[Future] = None
 
@@ -248,8 +261,10 @@ class SpladeIndex(SearchIndex):
         # backend, which silently kept its own default.
         backend.setdefault("threads", self.threads)
         if backend["backend_type"] == "lucene":
+            # The impact searcher reads query weights through this encoder's
+            # cache, so it must be the one that encodes the queries.
             # noinspection PyTypeChecker
-            backend["encoder_provider"] = self._get_encoder
+            backend["encoder_provider"] = self._get_query_encoder
             # noinspection PyTypeChecker
             backend["expected_doc_count_provider"] = self._expected_doc_count
         return IndexBackend.from_config(backend)
@@ -258,6 +273,15 @@ class SpladeIndex(SearchIndex):
         if self.encoder is None:
             self.encoder = SpladeEncoder(self.config, self.use_bettertransformer, self.quantization_factor)
         return self.encoder
+
+    def _get_query_encoder(self):
+        if self.query_model_name_or_path is None:
+            return self._get_encoder()
+        if self.query_encoder is None:
+            config = dict(self.config, name=self.query_model_name_or_path)
+            logging.info("Encoding queries with %s over the index of %s", self.query_model_name_or_path, self.model_name_or_path)
+            self.query_encoder = SpladeEncoder(config, self.use_bettertransformer, self.quantization_factor)
+        return self.query_encoder
 
     def supports_deferred_build(self) -> bool:
         """Whether build() returns before the index is queryable."""
@@ -512,20 +536,23 @@ class SpladeIndex(SearchIndex):
         if results is not None: return results
         # No query may hit a half-written index.
         self.wait_for_build()
-        if self.encoder is None: self._get_encoder()
+        query_encoder = self._get_query_encoder()
         results = {}
         for i in tqdm(range(0, len(queries), batch_size), desc="Searching in splade index", disable=not verbose):
             batch: List[IndexInput] = queries[i:i + batch_size]
             texts = [val.text for val in batch]
             ids = [val.id for val in batch]
             with torch.no_grad():
-                encoded_texts = self.encoder.encode_queries(texts, batch_size=self.batch_size, query_ids=ids)
+                encoded_texts = query_encoder.encode_queries(texts, batch_size=self.batch_size, query_ids=ids)
             batch_results = self.backend.search(texts, encoded_texts, ids, top_k=k)
             results.update(batch_results)
         self.save_results_to_cache(k, cache_prefix, results)
         return results
 
     def name(self):
+        if self.query_model_name_or_path is not None:
+            q = self.query_model_name_or_path.replace("/", "_").replace(".", "_")
+            return f"splade_{self.index_name}_q_{q}"
         return f"splade_{self.index_name}"
 
     def __len__(self):
